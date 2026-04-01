@@ -1,0 +1,14 @@
+{
+  "_comment": "推荐的权限白名单，合并到项目的 .claude/settings.local.json 中",
+  "permissions": {
+    "allow": [
+      "mcp__codex__codex",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git checkout:*)",
+      "Bash(git log:*)"
+    ]
+  }
+}
