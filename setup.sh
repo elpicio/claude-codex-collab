@@ -76,18 +76,17 @@ echo
 echo "[3/4] 检查 CLAUDE.md..."
 
 CLAUDE_MD="$PROJECT_ROOT/CLAUDE.md"
+SNIPPET="$SCRIPT_DIR/templates/claude-md-snippet.md"
 if [[ -f "$CLAUDE_MD" ]]; then
     if grep -q "多 Agent 协作" "$CLAUDE_MD" 2>/dev/null || grep -q "多Agent协作" "$CLAUDE_MD" 2>/dev/null; then
         echo "  ! CLAUDE.md 已包含协作章节，跳过"
     else
-        echo "  → CLAUDE.md 存在但缺少协作章节"
-        echo "    请手动将以下文件内容追加到 CLAUDE.md："
-        echo "    $SCRIPT_DIR/templates/claude-md-snippet.md"
+        run bash -c "printf '\n\n' >> '$CLAUDE_MD' && cat '$SNIPPET' >> '$CLAUDE_MD'"
+        echo "  ✓ 协作章节已追加到 CLAUDE.md"
     fi
 else
-    echo "  → CLAUDE.md 不存在"
-    echo "    建议创建 CLAUDE.md 并包含协作章节："
-    echo "    cp $SCRIPT_DIR/templates/claude-md-snippet.md $CLAUDE_MD"
+    run cp "$SNIPPET" "$CLAUDE_MD"
+    echo "  ✓ CLAUDE.md 已创建（含协作章节）"
 fi
 echo
 
