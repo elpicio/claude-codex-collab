@@ -36,12 +36,10 @@ if ! command -v claude &>/dev/null; then
     exit 1
 fi
 
-if ! git rev-parse --is-inside-work-tree &>/dev/null; then
-    echo "ERROR: 当前目录不是 git 仓库。请在 git 仓库根目录下运行。"
-    exit 1
+PROJECT_ROOT="$(pwd)"
+if ! git -C "$PROJECT_ROOT" rev-parse --is-inside-work-tree &>/dev/null; then
+    echo "⚠ 当前目录不是 git 仓库，git 安全兜底（diff/回滚）将不可用"
 fi
-
-PROJECT_ROOT="$(git rev-parse --show-toplevel)"
 echo "项目根目录: $PROJECT_ROOT"
 echo
 
