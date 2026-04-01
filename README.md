@@ -146,8 +146,10 @@ globs: ["src/**/*.py", "tests/**/*.py"]  # 改成你的路径
 globs: ["src/**/*.ts", "src/**/*.tsx"]
 ```
 
-## 来源
+## Acknowledgments
 
-提炼自 [ai4stock](https://github.com/elp/ai4stock) 项目的实战经验，参考了：
-- [ching-kuo/claude-codex](https://github.com/ching-kuo/claude-codex) — MCP 集成方案
-- [ccg-workflow](https://github.com/anthropics/ccg-workflow) — 社区协作模式
+本项目的设计思路受到以下开源项目的启发，感谢这些项目的贡献：
+
+- [ching-kuo/claude-codex](https://github.com/ching-kuo/claude-codex) — MCP 集成方案与三阶段工作流设计
+- [fengshao1227/ccg-workflow](https://github.com/fengshao1227/ccg-workflow) — Claude Code + Codex 协作模式与安全模型
+- [xiangz19/codex-ratelimit](https://github.com/xiangz19/codex-ratelimit) — Codex 配额监控脚本
