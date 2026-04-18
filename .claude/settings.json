@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/env python3 \"$(git rev-parse --show-toplevel)/.orchestration/hooks/session_start.py\" --backend claude"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "backend": "codex",
+  "commands": {
+    "plan": ["codex", "exec", "--cd", "{cwd}", "--sandbox", "workspace-write"],
+    "implement": ["codex", "exec", "--cd", "{cwd}", "--sandbox", "workspace-write"],
+    "review": ["codex", "review", "--uncommitted"]
+  }
+}

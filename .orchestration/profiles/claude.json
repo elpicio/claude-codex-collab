@@ -1,0 +1,8 @@
+{
+  "backend": "claude",
+  "commands": {
+    "plan": ["claude", "-p", "--permission-mode", "plan"],
+    "implement": ["claude", "-p", "--permission-mode", "default"],
+    "review": ["claude", "-p", "--permission-mode", "plan"]
+  }
+}
