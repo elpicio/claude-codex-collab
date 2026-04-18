@@ -8,9 +8,15 @@ import json
 import os
 import re
 import subprocess
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-posix fallback
+    fcntl = None
 
 ORCH_DIR = ".orchestration"
 LOCAL_COMMON_DIR = ".local-common-dir"
@@ -42,6 +48,10 @@ CONTEXT_NOTES = {
     "implement": "Task scope and the intended implementation target.",
     "review": "Task scope and the criteria that review must check.",
 }
+MAILBOX_BACKENDS = {"claude", "codex"}
+MAILBOX_MESSAGE_TYPES = {"request", "result"}
+MAILBOX_REQUEST_STATUSES = {"pending", "acked", "resolved"}
+MAILBOX_RESULT_STATUSES = {"succeeded", "failed", "cancelled", "retry_requested"}
 
 
 class RuntimeConflictError(RuntimeError):
@@ -289,6 +299,18 @@ def shared_runtime_path(root: Path, task_id: str) -> Path:
     return shared_runtime_root(root) / "runtime" / f"{task_id}.json"
 
 
+def mailbox_dir_path(root: Path) -> Path:
+    return shared_runtime_root(root) / "messages"
+
+
+def mailbox_path(root: Path, task_id: str) -> Path:
+    return mailbox_dir_path(root) / f"{task_id}.jsonl"
+
+
+def mailbox_lock_path(root: Path, task_id: str) -> Path:
+    return mailbox_dir_path(root) / f"{task_id}.lock"
+
+
 def shared_log_dir(root: Path, task_id: str) -> Path:
     return shared_runtime_root(root) / "logs" / task_id
 
@@ -320,6 +342,271 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
 def write_jsonl(path: Path, entries: list[dict[str, Any]]) -> None:
     lines = [json.dumps(entry, ensure_ascii=True) for entry in entries]
     atomic_write_text(path, "\n".join(lines) + ("\n" if lines else ""))
+
+
+def normalize_mailbox_backend(backend: str) -> str:
+    normalized = str(backend).strip().lower()
+    if normalized not in MAILBOX_BACKENDS:
+        raise ValueError(f"unsupported mailbox backend: {backend}")
+    return normalized
+
+
+def normalize_mailbox_type(message_type: str) -> str:
+    normalized = str(message_type).strip().lower()
+    if normalized not in MAILBOX_MESSAGE_TYPES:
+        raise ValueError(f"unsupported mailbox message type: {message_type}")
+    return normalized
+
+
+def normalize_mailbox_result_status(status: str) -> str:
+    normalized = str(status).strip().lower()
+    if normalized not in MAILBOX_RESULT_STATUSES:
+        raise ValueError(f"unsupported mailbox result status: {status}")
+    return normalized
+
+
+def mailbox_message_id() -> str:
+    return f"msg-{uuid.uuid4().hex}"
+
+
+def _require_task(root: Path, task_id: str) -> None:
+    try:
+        load_contract(root, task_id)
+    except FileNotFoundError as exc:
+        raise ValueError(f"task not found: {task_id}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"task contract unreadable: {task_id}") from exc
+    except OSError as exc:
+        raise ValueError(f"task contract unreadable: {task_id}") from exc
+
+
+def load_mailbox_entries(root: Path, task_id: str) -> list[dict[str, Any]]:
+    # This is a raw read helper; mutating callers must hold the mailbox lock.
+    path = mailbox_path(root, task_id)
+    if not path.exists():
+        return []
+    return read_jsonl(path)
+
+
+def save_mailbox_entries(root: Path, task_id: str, entries: list[dict[str, Any]]) -> Path:
+    # Callers must hold the per-task mailbox lock before writing.
+    path = mailbox_path(root, task_id)
+    write_jsonl(path, entries)
+    return path
+
+
+def mutate_mailbox_entries(
+    root: Path,
+    task_id: str,
+    mutator: Callable[[list[dict[str, Any]]], dict[str, Any]],
+) -> dict[str, Any]:
+    _require_task(root, task_id)
+    mailbox_dir_path(root).mkdir(parents=True, exist_ok=True)
+    lock_path = mailbox_lock_path(root, task_id)
+    with lock_path.open("a", encoding="utf-8") as lock_handle:
+        if fcntl is not None:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            entries = load_mailbox_entries(root, task_id)
+            result = mutator(entries)
+            save_mailbox_entries(root, task_id, entries)
+            return result
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+
+def find_mailbox_message(
+    entries: list[dict[str, Any]], message_id: str
+) -> tuple[int, dict[str, Any]] | tuple[None, None]:
+    for index, message in enumerate(entries):
+        if str(message.get("id")) == message_id:
+            return index, message
+    return None, None
+
+
+def mailbox_send(
+    root: Path,
+    task_id: str,
+    *,
+    from_backend: str,
+    to_backend: str,
+    summary: str,
+    details: str = "",
+) -> dict[str, Any]:
+    sender = normalize_mailbox_backend(from_backend)
+    receiver = normalize_mailbox_backend(to_backend)
+    if sender == receiver:
+        raise ValueError("mailbox sender and receiver must be different backends")
+    summary_text = summary.strip()
+    if not summary_text:
+        raise ValueError("mailbox request summary cannot be empty")
+    details_text = details.strip()
+
+    def apply(entries: list[dict[str, Any]]) -> dict[str, Any]:
+        timestamp = now_iso()
+        payload: dict[str, Any] = {"summary": summary_text}
+        if details_text:
+            payload["details"] = details_text
+        message = {
+            "id": mailbox_message_id(),
+            "task_id": task_id,
+            "type": "request",
+            "status": "pending",
+            "from": sender,
+            "to": receiver,
+            "reply_to": None,
+            "created_at": timestamp,
+            "updated_at": timestamp,
+            "ack": None,
+            "payload": payload,
+        }
+        entries.append(message)
+        return message
+
+    return mutate_mailbox_entries(root, task_id, apply)
+
+
+def mailbox_read(
+    root: Path,
+    task_id: str,
+    *,
+    to_backend: str | None = None,
+    message_type: str | None = None,
+    only_unacked: bool = False,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    # Returns a parsed snapshot for this call; callers should not rely on object identity across reads.
+    _require_task(root, task_id)
+    # Intentionally allow cross-backend queries when to_backend is omitted.
+    receiver = normalize_mailbox_backend(to_backend) if to_backend else None
+    normalized_type = normalize_mailbox_type(message_type) if message_type else None
+    if only_unacked and normalized_type != "request":
+        raise ValueError("mailbox read with --unacked requires message_type='request'")
+    if limit is not None and limit <= 0:
+        raise ValueError("mailbox read limit must be greater than zero")
+
+    entries = load_mailbox_entries(root, task_id)
+    filtered = []
+    for message in entries:
+        if receiver and str(message.get("to")) != receiver:
+            continue
+        if normalized_type and str(message.get("type")) != normalized_type:
+            continue
+        if only_unacked and str(message.get("status")) != "pending":
+            continue
+        filtered.append(message)
+    if limit is not None:
+        filtered = filtered[:limit]
+    return filtered
+
+
+def mailbox_ack(
+    root: Path,
+    task_id: str,
+    *,
+    message_id: str,
+    by_backend: str,
+    note: str = "",
+) -> dict[str, Any]:
+    backend = normalize_mailbox_backend(by_backend)
+    note_text = note.strip()
+
+    def apply(entries: list[dict[str, Any]]) -> dict[str, Any]:
+        index, message = find_mailbox_message(entries, message_id)
+        if index is None or message is None:
+            raise ValueError(f"mailbox message not found: {message_id}")
+        if str(message.get("to")) != backend:
+            raise ValueError(f"mailbox message {message_id} is not addressed to backend: {backend}")
+        if str(message.get("type")) != "request":
+            raise ValueError("mailbox ack only supports request messages")
+        status = str(message.get("status"))
+        if status not in MAILBOX_REQUEST_STATUSES:
+            raise ValueError(f"mailbox message status is invalid: {message.get('status')}")
+        if status == "resolved":
+            raise ValueError(f"mailbox request already resolved: {message_id}")
+        if message.get("ack") is not None:
+            raise ValueError(f"mailbox message already acknowledged: {message_id}")
+
+        timestamp = now_iso()
+        ack_payload: dict[str, Any] = {"by": backend, "at": timestamp}
+        if note_text:
+            ack_payload["note"] = note_text
+        message["ack"] = ack_payload
+        message["status"] = "acked"
+        message["updated_at"] = timestamp
+        entries[index] = message
+        return message
+
+    return mutate_mailbox_entries(root, task_id, apply)
+
+
+def mailbox_result(
+    root: Path,
+    task_id: str,
+    *,
+    request_id: str,
+    from_backend: str,
+    status: str,
+    summary: str,
+    details: str = "",
+) -> dict[str, Any]:
+    sender = normalize_mailbox_backend(from_backend)
+    resolved_status = normalize_mailbox_result_status(status)
+    summary_text = summary.strip()
+    if not summary_text:
+        raise ValueError("mailbox result summary cannot be empty")
+    details_text = details.strip()
+
+    def apply(entries: list[dict[str, Any]]) -> dict[str, Any]:
+        index, request_message = find_mailbox_message(entries, request_id)
+        if index is None or request_message is None:
+            raise ValueError(f"mailbox request not found: {request_id}")
+        if str(request_message.get("type")) != "request":
+            raise ValueError(f"mailbox message is not a request: {request_id}")
+        request_status = str(request_message.get("status"))
+        if request_status == "resolved":
+            raise ValueError(f"mailbox request already resolved: {request_id}")
+        if request_status != "acked":
+            raise ValueError(
+                f"mailbox request must be acknowledged before result: {request_id} ({request_status})"
+            )
+        if request_message.get("ack") is None:
+            raise ValueError(f"mailbox request missing ack metadata: {request_id}")
+        if str(request_message.get("to")) != sender:
+            raise ValueError(
+                f"mailbox request {request_id} is assigned to {request_message.get('to')}, got {sender}"
+            )
+        receiver = normalize_mailbox_backend(str(request_message.get("from")))
+
+        timestamp = now_iso()
+        payload: dict[str, Any] = {"summary": summary_text}
+        if details_text:
+            payload["details"] = details_text
+        result_message = {
+            "id": mailbox_message_id(),
+            "task_id": task_id,
+            "type": "result",
+            "status": resolved_status,
+            "from": sender,
+            "to": receiver,
+            "reply_to": request_id,
+            "created_at": timestamp,
+            "updated_at": timestamp,
+            "ack": None,
+            "payload": payload,
+        }
+        entries.append(result_message)
+
+        request_message["status"] = "resolved"
+        request_message["resolution"] = resolved_status
+        request_message["resolved_at"] = timestamp
+        request_message["result_id"] = result_message["id"]
+        request_message["updated_at"] = timestamp
+        entries[index] = request_message
+        return result_message
+
+    return mutate_mailbox_entries(root, task_id, apply)
 
 
 def current_branch(root: Path) -> tuple[str | None, bool]:

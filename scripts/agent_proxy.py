@@ -13,6 +13,10 @@ from scripts.agent_proxy_core import (
     PhaseTransitionError,
     RuntimeConflictError,
     auto_repair_attachment,
+    mailbox_ack,
+    mailbox_read,
+    mailbox_result,
+    mailbox_send,
     build_command,
     create_task,
     create_worktree,
@@ -41,6 +45,10 @@ __all__ = [
     "PhaseRequirementError",
     "PhaseTransitionError",
     "RuntimeConflictError",
+    "mailbox_ack",
+    "mailbox_read",
+    "mailbox_result",
+    "mailbox_send",
     "build_command",
     "create_task",
     "create_worktree",
@@ -85,6 +93,60 @@ def resolve_action_path(root: Path, raw_path: str | None) -> Path | None:
     return path.resolve()
 
 
+def execute_mailbox_command(
+    root: Path,
+    mailbox_command: str,
+    *,
+    task_id: str,
+    params: dict[str, object],
+) -> dict[str, object]:
+    if mailbox_command == "send":
+        sender = resolve_backend(root, params.get("from_backend") or params.get("from"))  # type: ignore[arg-type]
+        return mailbox_send(
+            root,
+            task_id,
+            from_backend=sender,
+            to_backend=str(params["to"]),
+            summary=str(params["summary"]),
+            details=str(params.get("details") or ""),
+        )
+    if mailbox_command == "read":
+        messages = mailbox_read(
+            root,
+            task_id,
+            to_backend=str(params["to"]) if params.get("to") is not None else None,
+            message_type=str(params["type"]) if params.get("type") is not None else None,
+            only_unacked=bool(params.get("unacked")),
+            limit=int(params["limit"]) if params.get("limit") is not None else None,
+        )
+        return {
+            "task_id": task_id,
+            "count": len(messages),
+            "messages": messages,
+        }
+    if mailbox_command == "ack":
+        backend = resolve_backend(root, params.get("by"))  # type: ignore[arg-type]
+        return mailbox_ack(
+            root,
+            task_id,
+            message_id=str(params["message_id"]),
+            by_backend=backend,
+            note=str(params.get("note") or ""),
+        )
+    if mailbox_command == "result":
+        sender = resolve_backend(root, params.get("from_backend") or params.get("from"))  # type: ignore[arg-type]
+        return mailbox_result(
+            root,
+            task_id,
+            request_id=str(params["request_id"]),
+            from_backend=sender,
+            status=str(params["status"]),
+            summary=str(params["summary"]),
+            details=str(params.get("details") or ""),
+        )
+    raise ValueError(f"Unsupported mailbox command: {mailbox_command}")
+
+
 def handle_action(
     root: Path, action: ParsedAction, last_task_id: str | None
 ) -> tuple[int, str | None]:
@@ -111,6 +173,16 @@ def handle_action(
         task_id = resolve_task_id(root, params.get("task_id"), last_task_id)
         path = write_handoff(root, task_id, params["to"], params["summary"])
         print(f"handoff: {path.relative_to(root)}")
+        return 0, task_id
+    if action.name.startswith("mailbox-"):
+        task_id = resolve_task_id(root, params.get("task_id"), last_task_id)
+        payload = execute_mailbox_command(
+            root,
+            action.name.removeprefix("mailbox-"),
+            task_id=task_id,
+            params=params,
+        )
+        print(json.dumps(payload, indent=2, ensure_ascii=True))
         return 0, task_id
     if action.name == "migrate-legacy-task":
         legacy_path = resolve_action_path(root, params.get("path"))
@@ -274,6 +346,58 @@ def build_parser() -> argparse.ArgumentParser:
     handoff_parser.add_argument("--to", choices=("claude", "codex"), required=True)
     handoff_parser.add_argument("--summary", default="")
 
+    mailbox_parser = subparsers.add_parser(
+        "mailbox",
+        help="Send, read, acknowledge, and resolve structured Claude/Codex messages.",
+    )
+    mailbox_subparsers = mailbox_parser.add_subparsers(dest="mailbox_command", required=True)
+
+    mailbox_send_parser = mailbox_subparsers.add_parser("send", help="Send a mailbox request.")
+    mailbox_send_parser.add_argument("--task-id", required=True)
+    mailbox_send_parser.add_argument("--to", choices=("claude", "codex"), required=True)
+    mailbox_send_parser.add_argument("--from", dest="from_backend")
+    mailbox_send_parser.add_argument("--summary", required=True)
+    mailbox_send_parser.add_argument("--details", default="")
+
+    mailbox_read_parser = mailbox_subparsers.add_parser(
+        "read",
+        help="Read mailbox messages in append order (oldest first).",
+    )
+    mailbox_read_parser.add_argument("--task-id", required=True)
+    mailbox_read_parser.add_argument("--to", choices=("claude", "codex"))
+    mailbox_read_parser.add_argument("--type", choices=("request", "result"))
+    mailbox_read_parser.add_argument(
+        "--unacked",
+        action="store_true",
+        help="Only return unacked request messages (requires --type request).",
+    )
+    mailbox_read_parser.add_argument(
+        "--limit",
+        type=int,
+        help="Maximum number of filtered messages to return (oldest first).",
+    )
+
+    mailbox_ack_parser = mailbox_subparsers.add_parser("ack", help="Acknowledge a mailbox message.")
+    mailbox_ack_parser.add_argument("--task-id", required=True)
+    mailbox_ack_parser.add_argument("--message-id", required=True)
+    mailbox_ack_parser.add_argument("--by")
+    mailbox_ack_parser.add_argument("--note", default="")
+
+    mailbox_result_parser = mailbox_subparsers.add_parser(
+        "result",
+        help="Write a mailbox result for a previously sent request.",
+    )
+    mailbox_result_parser.add_argument("--task-id", required=True)
+    mailbox_result_parser.add_argument("--request-id", required=True)
+    mailbox_result_parser.add_argument(
+        "--status",
+        choices=("succeeded", "failed", "cancelled", "retry_requested"),
+        required=True,
+    )
+    mailbox_result_parser.add_argument("--from", dest="from_backend")
+    mailbox_result_parser.add_argument("--summary", required=True)
+    mailbox_result_parser.add_argument("--details", default="")
+
     worktree_parser = subparsers.add_parser("worktree", help="Create or inspect a task worktree.")
     worktree_subparsers = worktree_parser.add_subparsers(dest="worktree_command", required=True)
 
@@ -401,6 +525,15 @@ def main(argv: list[str] | None = None) -> int:
             return run_phase(root, args.phase, args.task_id, backend, args.dry_run)
         if args.command == "handoff":
             print(write_handoff(root, args.task_id, args.to, args.summary).relative_to(root))
+            return 0
+        if args.command == "mailbox":
+            payload = execute_mailbox_command(
+                root,
+                args.mailbox_command,
+                task_id=args.task_id,
+                params=vars(args),
+            )
+            print(json.dumps(payload, indent=2, ensure_ascii=True))
             return 0
         if args.command == "worktree":
             if args.worktree_command == "create":

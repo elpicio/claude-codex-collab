@@ -1,57 +1,102 @@
 # Claude / Codex Mailbox
 
-## 背景
+## 状态
 
-当前的 `claude_codex` 模式已经有共享任务目录、shared runtime、日志和 handoff，但还没有一条明确的 Claude -> Codex -> Claude 结果通道。
+mailbox v1 已实现，代码入口：
 
-现在 Claude 可以通过 `agent_proxy` 触发 `codex exec`，Codex 的结果主要散在这几个位置：
+- `scripts/agent_proxy_core.py`
+- `scripts/agent_proxy.py`
+- `tests/test_agent_proxy_core.py`
 
-- shared runtime 里的 phase 状态
-- shared log 里的 stdout / stderr
-- worktree 里的代码改动
-- `handoffs/` 里的交接说明
+## v1 范围
 
-这套方式足够做一次性委托，但不适合结构化回传，也不适合后面继续扩成多轮协作。
+只覆盖 `claude_codex` 模式下的单任务消息流，不处理跨任务调度和多 agent 广播。
 
-## 目标
+## 存储位置
 
-补一层 mailbox，让 Claude 发给 Codex 的任务和 Codex 回给 Claude 的结果都有固定格式和固定位置。
-
-这层 mailbox 先服务一个最直接的流程：
-
-1. Claude 写一条实现请求
-2. Codex 读取请求并执行
-3. Codex 写回结果和摘要
-4. Claude 读取结果后决定 review、verify 或 handoff
-
-## 范围
-
-第一版只覆盖 `claude_codex` 模式下的单任务消息流，不处理跨任务调度，也不处理多 agent 广播。
-
-第一版至少要解决这些问题：
-
-- 消息放哪里
-- 谁负责写入和读取
-- 请求和结果的最小字段是什么
-- Claude 如何知道 Codex 已完成
-- 失败、取消和重试如何表达
-
-## 候选方向
-
-优先考虑 shared runtime 下的结构化消息文件，例如：
+消息统一写在 shared runtime 下：
 
 - `$(git rev-parse --git-common-dir)/<repo-name>/messages/<task-id>.jsonl`
 
-或者按 run 拆目录：
+每行一条 JSON 消息，追加写入，便于审计和回放。
 
-- `$(git rev-parse --git-common-dir)/<repo-name>/messages/<task-id>/<message-id>.json`
+写入实现使用 `flock` 文件锁，避免 Claude/Codex 并发写同一 task mailbox 时互相覆盖。
 
-先不要引入 MCP。当前目标是把 Claude 和 Codex 之间的结果回传做清楚。
+## 消息模型
 
-## 下一步
+统一字段：
 
-- 定 mailbox 路径和生命周期
-- 定消息格式
-- 定 `agent_proxy` 的消息命令
-- 定 Claude 发起委托和 Codex 回写结果的最短流程
-- 补测试，至少覆盖 send / read / ack / result
+- `id`
+- `task_id`
+- `type` (`request` / `result`)
+- `status`
+- `from`
+- `to`
+- `reply_to`
+- `created_at`
+- `updated_at`
+- `ack`
+- `payload`
+
+`request` 状态：
+
+- `pending`
+- `acked`
+- `resolved`
+
+`result` 状态（用于表达执行结果）：
+
+- `succeeded`
+- `failed`
+- `cancelled`
+- `retry_requested`
+
+当写入 `result` 时，会同步把对应 `request` 标记为 `resolved`，并记录 `resolution` 与 `result_id`。
+
+协议约束：
+
+- `ack` 只允许对 `request` 消息执行一次，不允许覆盖已有 ack。
+- `result` 只能回写到已 `acked` 的 `request`。
+
+## 命令
+
+`agent_proxy` 新增 `mailbox` 子命令：
+
+- `mailbox send`
+- `mailbox read`
+- `mailbox ack`
+- `mailbox result`
+
+`mailbox read --limit N` 返回过滤后的前 N 条消息（按 append 顺序，即最旧优先）。
+
+`mailbox read --unacked` 只支持 `--type request`，用于轮询未 ack 的请求消息。
+
+`mailbox read` 在不提供 `--to` 时会跨 backend 查询，便于查看同一 task 的全量请求或结果。
+
+示例：
+
+```bash
+python -m scripts.agent_proxy mailbox send --task-id task-123 --to codex --summary "实现 mailbox v1"
+python -m scripts.agent_proxy mailbox read --task-id task-123 --to codex --type request
+python -m scripts.agent_proxy mailbox ack --task-id task-123 --message-id <request-id> --by codex
+python -m scripts.agent_proxy mailbox result --task-id task-123 --request-id <request-id> --from codex --status succeeded --summary "实现完成并补测试"
+python -m scripts.agent_proxy mailbox read --task-id task-123 --to claude --type result
+```
+
+## 最短流程
+
+1. Claude `send` 请求给 Codex
+2. Codex `read` 请求
+3. Codex `ack` 请求
+4. Codex `result` 回写结果（成功/失败/取消/重试）
+5. Claude `read` 结果并决定进入 review / verify / handoff
+
+Claude 判断 Codex 完成的标准是：收到 `type=result` 且 `to=claude` 的消息。
+
+## 测试覆盖
+
+当前测试至少覆盖：
+
+- `send -> read -> ack -> result` 主流程
+- `failed / cancelled / retry_requested` 状态表达
+- `ack` 收件人校验
