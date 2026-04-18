@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Claude Code + Codex MCP 协作模块安装脚本
-# 用法: bash setup.sh [--dry-run]
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DRY_RUN=false
 
@@ -21,10 +18,22 @@ run() {
     fi
 }
 
-echo "=== Claude Code + Codex MCP 协作模块安装 ==="
-echo
+copy_if_missing() {
+    local source_path="$1"
+    local target_path="$2"
 
-# ── 0. 前置检查 ──────────────────────────────────
+    if [[ -e "$target_path" ]]; then
+        echo "  ! ${target_path} 已存在，跳过"
+        return
+    fi
+
+    run mkdir -p "$(dirname "$target_path")"
+    run cp "$source_path" "$target_path"
+    echo "  ✓ 已写入 ${target_path}"
+}
+
+echo "=== Shared Claude / Codex Control Plane 安装 ==="
+echo
 
 if ! command -v codex &>/dev/null; then
     echo "ERROR: codex CLI 未安装。请先安装: npm install -g @openai/codex"
@@ -37,86 +46,127 @@ if ! command -v claude &>/dev/null; then
 fi
 
 PROJECT_ROOT="$(pwd)"
+HAS_GIT=true
 if ! git -C "$PROJECT_ROOT" rev-parse --is-inside-work-tree &>/dev/null; then
-    echo "⚠ 当前目录不是 git 仓库，git 安全兜底（diff/回滚）将不可用"
+    HAS_GIT=false
+    echo "⚠ 当前目录不是 git 仓库，worktree、shared runtime 和 hooksPath 相关能力不会完整生效"
 fi
+
 echo "项目根目录: $PROJECT_ROOT"
 echo
 
-# ── 1. 注册 MCP Server ──────────────────────────
-
 echo "[1/4] 注册 Codex MCP Server..."
 
-if claude mcp list 2>/dev/null | grep -q "codex"; then
+if timeout 5 claude mcp list 2>/dev/null | grep -q "codex"; then
     echo "  ✓ Codex MCP 已注册，跳过"
 else
+    echo "  ! 未能确认 Codex MCP 是否已注册，继续执行注册命令"
     run claude mcp add codex -s user -- codex -c sandbox=workspace-write mcp-server
     echo "  ✓ Codex MCP 注册完成"
 fi
 echo
 
-# ── 2. 复制委派规则 ──────────────────────────────
+echo "[2/4] 安装共享控制面骨架..."
 
-echo "[2/4] 安装委派规则..."
+FILES_TO_COPY=(
+    "AGENTS.md"
+    "requirements-dev.txt"
+    ".claude/README.md"
+    ".claude/rules/codex-delegation.md"
+    ".orchestration/README.md"
+    ".orchestration/specs/index.md"
+    ".orchestration/specs/project.md"
+    ".orchestration/specs/documentation.md"
+    ".orchestration/specs/coding.md"
+    ".orchestration/specs/review.md"
+    ".orchestration/specs/adapters.md"
+    ".orchestration/profiles/claude.json"
+    ".orchestration/profiles/codex.json"
+    ".orchestration/codex/config.toml"
+    ".orchestration/codex/hooks.json"
+    ".orchestration/hooks/session_start.py"
+    ".orchestration/codex/agents/planner.toml"
+    ".orchestration/codex/agents/implementer.toml"
+    ".orchestration/codex/agents/reviewer.toml"
+    ".githooks/pre-commit"
+    "memory/INDEX.md"
+    "memory/current/INDEX.md"
+    "memory/current/project_overview.md"
+    "memory/current/progress.md"
+    "memory/current/docs_structure.md"
+    "memory/history/README.md"
+    "docs/INDEX.md"
+    "docs/project-status.md"
+    "docs/control-plane-implementation-status.md"
+    "docs/todo/README.md"
+    "docs/archive/README.md"
+    "scripts/__init__.py"
+    "scripts/agent_proxy.py"
+    "scripts/agent_proxy_core.py"
+    "scripts/agent_proxy_nl.py"
+    "scripts/materialize_codex_adapter.py"
+    "scripts/check_documentation_layout.py"
+    "scripts/bootstrap_repo.py"
+    "scripts/ratelimit_checker.py"
+)
 
-run mkdir -p "$PROJECT_ROOT/.claude/rules"
-
-TARGET_RULE="$PROJECT_ROOT/.claude/rules/codex-delegation.md"
-if [[ -f "$TARGET_RULE" ]]; then
-    echo "  ! $TARGET_RULE 已存在，跳过（不覆盖）"
-    echo "    如需更新，请手动对比: $SCRIPT_DIR/templates/rules/codex-delegation.md"
-else
-    run cp "$SCRIPT_DIR/templates/rules/codex-delegation.md" "$TARGET_RULE"
-    echo "  ✓ 委派规则已复制到 .claude/rules/"
+for relative_path in "${FILES_TO_COPY[@]}"; do
+    copy_if_missing "$SCRIPT_DIR/$relative_path" "$PROJECT_ROOT/$relative_path"
+done
+if [[ -f "$PROJECT_ROOT/.githooks/pre-commit" ]]; then
+    run chmod +x "$PROJECT_ROOT/.githooks/pre-commit"
 fi
 echo
 
-# ── 3. CLAUDE.md 协作章节 ─────────────────────────
-
-echo "[3/4] 检查 CLAUDE.md..."
+echo "[3/4] 写入 CLAUDE.md 入口..."
 
 CLAUDE_MD="$PROJECT_ROOT/CLAUDE.md"
 SNIPPET="$SCRIPT_DIR/templates/claude-md-snippet.md"
 if [[ -f "$CLAUDE_MD" ]]; then
-    if grep -q "多 Agent 协作" "$CLAUDE_MD" 2>/dev/null || grep -q "多Agent协作" "$CLAUDE_MD" 2>/dev/null; then
-        echo "  ! CLAUDE.md 已包含协作章节，跳过"
+    if grep -q "Shared Control Plane" "$CLAUDE_MD" 2>/dev/null; then
+        echo "  ! CLAUDE.md 已包含共享控制面入口，跳过"
     else
-        run bash -c "printf '\n\n' >> '$CLAUDE_MD' && cat '$SNIPPET' >> '$CLAUDE_MD'"
-        echo "  ✓ 协作章节已追加到 CLAUDE.md"
+        if $DRY_RUN; then
+            echo "[dry-run] append snippet to $CLAUDE_MD"
+        else
+            printf '\n\n' >> "$CLAUDE_MD"
+            cat "$SNIPPET" >> "$CLAUDE_MD"
+        fi
+        echo "  ✓ 已追加共享控制面入口到 CLAUDE.md"
     fi
 else
-    run cp "$SNIPPET" "$CLAUDE_MD"
-    echo "  ✓ CLAUDE.md 已创建（含协作章节）"
+    copy_if_missing "$SNIPPET" "$CLAUDE_MD"
 fi
 echo
 
-# ── 4. 配额监控脚本 ──────────────────────────────
+echo "[4/4] 生成 .codex mirror 并配置 hooks..."
 
-echo "[4/4] 安装配额监控脚本..."
+if [[ -f "$PROJECT_ROOT/scripts/materialize_codex_adapter.py" ]]; then
+    run python "$PROJECT_ROOT/scripts/materialize_codex_adapter.py" --root "$PROJECT_ROOT" --target .codex
+    echo "  ✓ .codex mirror 已生成"
+fi
 
-run mkdir -p "$PROJECT_ROOT/scripts"
-
-TARGET_SCRIPT="$PROJECT_ROOT/scripts/ratelimit_checker.py"
-if [[ -f "$TARGET_SCRIPT" ]]; then
-    echo "  ! $TARGET_SCRIPT 已存在，跳过"
+if $HAS_GIT; then
+    run python "$PROJECT_ROOT/scripts/bootstrap_repo.py" --root "$PROJECT_ROOT"
+    echo "  ✓ git hooksPath 已配置"
 else
-    run cp "$SCRIPT_DIR/scripts/ratelimit_checker.py" "$TARGET_SCRIPT"
-    echo "  ✓ 配额监控脚本已复制到 scripts/"
+    echo "  ! 非 git 仓库，跳过 hooksPath 配置"
 fi
 echo
-
-# ── 完成 ─────────────────────────────────────────
 
 echo "=== 安装完成 ==="
 echo
 echo "后续步骤："
 echo "  1. 重启 Claude Code 会话（MCP 需要重启才能加载）"
-echo "  2. 在 Claude Code 中测试: 输入任意编码任务，观察是否通过 Codex 派发"
-echo "  3.（可选）编辑 .claude/rules/codex-delegation.md 调整委派路径范围"
-echo "  4.（可选）将 settings-permissions.json 中的权限合并到 .claude/settings.local.json"
+echo "  2. 查看 AGENTS.md、CLAUDE.md、.orchestration/README.md"
+echo "  3. 用 python -m scripts.agent_proxy status 检查控制面状态"
+echo "  4. 如需本地验证，先安装 requirements-dev.txt 里的开发依赖"
+echo "     conda: conda create -n shared-control-plane python=3.11 -y"
+echo "            conda activate shared-control-plane"
+echo "            python -m pip install -r requirements-dev.txt"
+echo "     uv:    uv venv --python 3.11"
+echo "            . .venv/bin/activate"
+echo "            uv pip install -r requirements-dev.txt"
+echo "  5. 再运行 python -m scripts.check_documentation_layout 和 python -m pytest -q tests"
 echo
 echo "权限参考文件: $SCRIPT_DIR/templates/settings-permissions.json"
-echo
-if ! $DRY_RUN; then
-    echo "⚠ 重要：请立即重启 Claude Code 会话，否则 MCP 工具不可用！"
-fi
