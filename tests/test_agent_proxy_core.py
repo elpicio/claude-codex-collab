@@ -129,7 +129,7 @@ def test_mailbox_send_read_ack_result_flow(tmp_path: Path) -> None:
         from_backend="claude",
         to_backend="codex",
         summary="Implement mailbox v1",
-        details="Follow docs/todo/claude-codex-mailbox.md",
+        details="Follow the mailbox request/result flow.",
     )
 
     codex_inbox = mailbox_read(root, "task-123", to_backend="codex", message_type="request")

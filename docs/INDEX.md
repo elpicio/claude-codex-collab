@@ -15,7 +15,6 @@
 | 路径 | 状态 | 内容 |
 |------|------|------|
 | [todo/README.md](todo/README.md) | guide | 待办和 WIP 文档的放置规则 |
-| [todo/claude-codex-mailbox.md](todo/claude-codex-mailbox.md) | todo | Claude -> Codex -> Claude 的 mailbox 和结果回传 |
 
 ## 归档目录
 
