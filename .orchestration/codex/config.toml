@@ -3,7 +3,7 @@ project_doc_max_bytes = 32768
 sandbox_mode = "workspace-write"
 
 [features]
-codex_hooks = true
+hooks = true
 
 [agents]
 max_threads = 4
